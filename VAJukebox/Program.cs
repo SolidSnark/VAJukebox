@@ -4,6 +4,8 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 
+using Newtonsoft.Json;
+
 namespace VAJukebox
 {
     public enum SearchType
@@ -21,17 +23,17 @@ namespace VAJukebox
         // 4) Search Phrase
         static void Main(string[] args)
         {
-            
-            string destinationFile = args[0];
-            string sourceDirectory = args[1];
-            SearchType searchType = SearchType.Artist;
-            string matchString = args[3].ToLower();
-
-            if (args.Length != 4)
+            if (args.Length < 3)
             {
                 Console.WriteLine("Invalid number of arguments.");
                 return;
             }
+
+            string destinationFile = args[0];
+            string sourcePath = args[1];
+
+            SearchType searchType = SearchType.Artist;
+            string matchString = args.Length == 4 ? args[3].ToLower() : string.Empty;
 
             try
             {
@@ -52,35 +54,36 @@ namespace VAJukebox
                 return;
             }
 
-            if (!Directory.Exists(sourceDirectory))
+            if (args[2] == "Rebuild")
             {
-                Console.WriteLine("Invalid Source Directory.");
+                GenerateIndex(sourcePath, destinationFile);
                 return;
             }
 
-            switch (args[2])
+            if (!File.Exists(sourcePath))
             {
-                case "Track":
-                    searchType = SearchType.Track;
-                    break;
-
-                case "Album":
-                    searchType = SearchType.Album;
-                    break;
-
-                case "Artist":
-                    searchType = SearchType.Artist;
-                    break;
-
-                default:
-                    Console.WriteLine("Invalid search type.");
-                    return;
+                Console.WriteLine("Invalid index file specified.");
+                return;
             }
 
-            matchString = matchString.Replace(" & ", " and ");
+            if (!Enum.TryParse<SearchType>(args[2], out searchType))
+            {
+                Console.WriteLine("Invalid search type.");
+                return;
+            }
 
-            List<Track> tracks = TrackLister.GetTracks(sourceDirectory, sourceDirectory);
-                                    
+            if (string.IsNullOrEmpty(matchString))
+            {
+                Console.WriteLine("Search term must be specified.");
+                return;
+            }
+
+            string trackJson = File.ReadAllText(sourcePath);
+            List<Track> tracks = JsonConvert.DeserializeObject<List<Track>>(trackJson);
+
+            matchString = matchString.Replace(" & ", " and ");
+            string byMatchString = matchString;
+
             bool artistSearch = false;
             const string byStr = " by ";
 
@@ -92,7 +95,8 @@ namespace VAJukebox
                 matchString = searchName + " - " + searchArtist;
                 artistSearch = true;
             }
-                        
+
+            Dictionary<string, List<Track>> byDictionary = new Dictionary<string, List<Track>>();
             Dictionary<string, List<Track>> tracknameDictionary = new Dictionary<string, List<Track>>();
             foreach (Track track in tracks)
             {
@@ -101,24 +105,20 @@ namespace VAJukebox
                 switch (searchType)
                 {
                     case SearchType.Track:
+                        keyName = track.Name;
                         if (artistSearch)
                         {
-                            keyName = track.Name + " - " + track.Artist;
+                            AddToDictionary(byDictionary, track, keyName);
+                            keyName += " - " + track.Artist;
                         }
-                        else
-                        {
-                            keyName = track.Name;
-                        }                        
                         break;
 
                     case SearchType.Album:
+                        keyName = track.Album;
                         if (artistSearch)
                         {
-                            keyName = track.Album + " - " + track.AlbumArtist;
-                        }
-                        else
-                        {
-                            keyName = track.Album;
+                            AddToDictionary(byDictionary, track, keyName);
+                            keyName += " - " + track.AlbumArtist;
                         }
                         break;
 
@@ -127,34 +127,54 @@ namespace VAJukebox
                         break;
                 }
 
-                if (!tracknameDictionary.ContainsKey(keyName))
-                {
-                    tracknameDictionary.Add(keyName, new List<Track>());
-                }
-
-                tracknameDictionary[keyName].Add(track);
+                AddToDictionary(tracknameDictionary, track, keyName);
             }
 
-            List<Track> searchResults = new List<Track>();
+            List<Track> searchResults = null;
+
+            // Quick check for exact match
             if (tracknameDictionary.ContainsKey(matchString))
             {
                 searchResults = tracknameDictionary[matchString];
             }
             else
             {
-                int shortestDistance = int.MaxValue;
+                int shortestByDistance = int.MaxValue;
+                List<Track> bySearchResults = null;
 
-                foreach (string key in tracknameDictionary.Keys)
+                if (artistSearch)
                 {
-                    int distance = StringDistance.LevenshteinDistance(key, matchString);
-                    if (distance < shortestDistance)
-                    {
-                        shortestDistance = distance;
-                        searchResults = tracknameDictionary[key];
-                    }
+                    // Check against bys
+                    bySearchResults = PerformSearch(byMatchString, byDictionary, out shortestByDistance);
+                }
+
+                int shortestDistance;
+                searchResults = PerformSearch(matchString, tracknameDictionary, out shortestDistance);
+
+                if (artistSearch && shortestByDistance < shortestDistance)
+                {
+                    // The bys have it
+                    searchResults = bySearchResults;
                 }
             }
 
+            searchResults = FormatResultsBySearchType(searchType, searchResults);
+
+            File.WriteAllLines(destinationFile, searchResults.Select(x => x.Filename));
+        }
+
+        private static void AddToDictionary(Dictionary<string, List<Track>> dictionary, Track track, string keyName)
+        {
+            if (!dictionary.ContainsKey(keyName))
+            {
+                dictionary.Add(keyName, new List<Track>());
+            }
+
+            dictionary[keyName].Add(track);
+        }
+
+        private static List<Track> FormatResultsBySearchType(SearchType searchType, List<Track> searchResults)
+        {
             if (searchType == SearchType.Track)
             {
                 searchResults = new List<Track> { Track.RandomPick(searchResults) };
@@ -165,11 +185,43 @@ namespace VAJukebox
             }
             else if (searchType == SearchType.Album)
             {
-
                 searchResults.Sort((x, y) => x.TrackNumber.CompareTo(y.TrackNumber));
             }
 
-            File.WriteAllLines(destinationFile, searchResults.Select(x => x.Filename));
+            return searchResults;
+        }
+
+        private static List<Track> PerformSearch(string matchString, Dictionary<string, List<Track>> tracknameDictionary, out int shortestDistance)
+        {
+            List<Track> searchResults = new List<Track>();
+            shortestDistance = int.MaxValue;
+
+            foreach (string key in tracknameDictionary.Keys)
+            {
+                int distance = StringDistance.LevenshteinDistance(key, matchString);
+                if (distance < shortestDistance)
+                {
+                    shortestDistance = distance;
+                    searchResults = tracknameDictionary[key];
+                }
+            }
+
+            return searchResults;
+        }
+
+        private static void GenerateIndex(string sourceDirectory, string targetFile)
+        {
+            List<string> musicExtensions = (
+                new List<string> { ".aa", ".aax", ".aac", ".aiff", ".ape", ".dsf", ".flac", ".m4a", ".m4b", 
+                    ".m4p", ".mp3", ".mpc", ".mpp", ".ogg", ".oga", ".wav", ".wma", ".wv", ".webm" 
+                }
+            );
+
+            List<Track> tracks = LibraryBuilder.GetTracks(sourceDirectory, sourceDirectory, musicExtensions);
+
+            string output = JsonConvert.SerializeObject(tracks);
+            File.WriteAllText(targetFile, output);
+            Console.WriteLine("Index completed");
         }
     }
 }
