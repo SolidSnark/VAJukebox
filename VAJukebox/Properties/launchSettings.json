@@ -1,0 +1,8 @@
+{
+  "profiles": {
+    "VAJukebox": {
+      "commandName": "Project",
+      "commandLineArgs": "\"c:\\temp\\test.m3u\" \"i:\\pcmusiclibrary\\music\" Album \"dark side of the moon\""
+    }
+  }
+}
